@@ -8,6 +8,7 @@
 namespace tvl {
 
 // 垂直列表弹窗 — Win32 顶层窗口 + 标准 ListBox
+// 使用全局 WH_MOUSE_LL 钩子(事件驱动,不轮询)实现屏幕边缘触发展开
 class VerticalListPopup {
 public:
     explicit VerticalListPopup(const AppSettings& settings);
@@ -37,10 +38,23 @@ public:
         reenumHandler_ = std::move(h);
     }
 
+    // 计算弹窗在屏幕上的目标区域(用于边缘检测)
+    RECT GetTargetRect() const;
+
+    // === 边缘触发(事件驱动,基于 WH_MOUSE_LL) ===
+    // 启用: 安装全局鼠标钩子,当鼠标移到屏幕右边缘时回调 onEdgeTrigger
+    static void EnableEdgeDetection(VerticalListPopup* popup,
+                                    std::function<void()> onEdgeTrigger);
+    // 禁用: 卸载全局鼠标钩子
+    static void DisableEdgeDetection();
+
 private:
     static LRESULT CALLBACK WndProcStatic(HWND, UINT, WPARAM, LPARAM);
     LRESULT WndProc(UINT msg, WPARAM wParam, LPARAM lParam);
     static LRESULT CALLBACK SubProcStatic(HWND, UINT, WPARAM, LPARAM);
+
+    // 全局鼠标钩子(持久安装,事件驱动)
+    static LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam);
 
     void RegisterPopupClass();
     void CreateChildControls();
@@ -71,7 +85,6 @@ private:
     std::vector<TrayIconInfo> allIcons_;
     std::vector<TrayIconInfo> filtered_;
     bool showing_ = false;
-    DWORD lastShowTime_ = 0;
     int hoveredIdx_ = -1;           // 当前鼠标悬停的项索引
     bool trackMouseLeave_ = false;  // 是否已请求 WM_MOUSELEAVE
 
@@ -80,6 +93,15 @@ private:
 
     WNDPROC listDefProc_ = nullptr;
     std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
+
+    // 持久钩子状态(static, 跨实例)
+    static HHOOK s_mouseHook;
+    static VerticalListPopup* s_activePopup;
+    static std::function<void()> s_edgeCallback;
+    static DWORD s_lastEdgeCheckMs; // 节流时间戳
+
+    static constexpr int     kEdgeTriggerMargin = 5;   // 距右边缘 px
+    static constexpr DWORD   kEdgeThrottleMs    = 50;  // 钩子内节流 ms
 };
 
 } // namespace tvl

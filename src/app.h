@@ -12,6 +12,7 @@
 namespace tvl {
 
 // 应用核心:隐藏消息窗口 + 托盘图标 + 热键 + 监听 + 弹窗编排
+// 菜单通过 WH_MOUSE_LL 全局钩子(事件驱动)响应屏幕右边缘触碰
 class App {
 public:
     App();

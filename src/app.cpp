@@ -176,6 +176,10 @@ void App::OpenSettings() {
             std::thread([this, ic, right]() { ClickIconAsync(ic, right); }).detach();
         });
         popup_->SetReenumerateHandler([this]() { return EnumerateTrayIconsAsync(); });
+        // 重新绑定边缘检测钩子到新弹窗实例
+        VerticalListPopup::EnableEdgeDetection(popup_, [this]() {
+            PostMessageW(hwnd_, WM_TOGGLE_MENU, 0, 0);
+        });
         PostMessageW(hwnd_, WM_REINIT_HOTKEY, 0, 0);
     });
     sw.Show(hwnd_);
@@ -184,6 +188,7 @@ void App::OpenSettings() {
 void App::Exit() {
     hotkeys_.UnregisterAll();
     StopMonitor();
+    VerticalListPopup::DisableEdgeDetection();
     if (popup_) popup_->Hide();
     Shell_NotifyIconW(NIM_DELETE, &nid_);
     if (nid_.hIcon) DestroyIcon(nid_.hIcon);
@@ -239,10 +244,16 @@ int App::Run() {
     });
     popup_->SetReenumerateHandler([this]() { return EnumerateTrayIconsAsync(); });
 
+    // 安装全局 WH_MOUSE_LL 钩子(事件驱动,不轮询):
+    // 鼠标移到屏幕右边缘 → 自动展开菜单
+    VerticalListPopup::EnableEdgeDetection(popup_, [this]() {
+        PostMessageW(hwnd_, WM_TOGGLE_MENU, 0, 0);
+    });
+
     CreateTrayIcon();
     InitializeHotkeys();
 
-    TraceLog("APP", "=== TrayVerticalList started ===");
+    TraceLog("APP", "=== TrayVerticalList started (event-driven edge detection) ===");
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0) > 0) {

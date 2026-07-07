@@ -15,27 +15,6 @@ namespace {
 constexpr UINT WM_REFRESH_DONE = WM_APP + 10;
 constexpr UINT WM_REAPPEAR     = WM_APP + 11;
 
-// 低层全局鼠标钩子：点击弹窗外任意位置即关闭
-static HHOOK g_mouseHook = nullptr;
-static VerticalListPopup* g_activePopup = nullptr;
-
-LRESULT CALLBACK MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
-    if (nCode >= 0 && g_activePopup) {
-        if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN ||
-            wParam == WM_NCLBUTTONDOWN || wParam == WM_NCRBUTTONDOWN) {
-            HWND h = g_activePopup->Hwnd();
-            if (h) {
-                auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
-                RECT rc; GetWindowRect(h, &rc);
-                if (!PtInRect(&rc, ms->pt)) {
-                    g_activePopup->Hide();
-                }
-            }
-        }
-    }
-    return CallNextHookEx(nullptr, nCode, wParam, lParam);
-}
-
 // 深色主题色板
 constexpr COLORREF C_BG     = RGB(30, 30, 34);
 constexpr COLORREF C_BG2    = RGB(40, 40, 46);
@@ -56,6 +35,72 @@ std::wstring FormatItemText(int index, const TrayIconInfo& icon) {
     if (prefix.size() < 4) prefix += L" ";
     return prefix + L"  " + icon.DisplayName();
 }
+} // end anonymous namespace
+
+// ===== 持久全局鼠标钩子(事件驱动,不轮询) =====
+HHOOK VerticalListPopup::s_mouseHook = nullptr;
+VerticalListPopup* VerticalListPopup::s_activePopup = nullptr;
+std::function<void()> VerticalListPopup::s_edgeCallback = nullptr;
+DWORD VerticalListPopup::s_lastEdgeCheckMs = 0;
+
+LRESULT CALLBACK VerticalListPopup::MouseHookProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode >= 0) {
+        auto* ms = reinterpret_cast<MSLLHOOKSTRUCT*>(lParam);
+
+        if (s_activePopup && s_activePopup->IsShowing()) {
+            // --- 菜单展开时: 点击菜单外 → 折叠 ---
+            if (wParam == WM_LBUTTONDOWN || wParam == WM_RBUTTONDOWN ||
+                wParam == WM_NCLBUTTONDOWN || wParam == WM_NCRBUTTONDOWN) {
+                HWND h = s_activePopup->Hwnd();
+                if (h) {
+                    RECT rc; GetWindowRect(h, &rc);
+                    if (!PtInRect(&rc, ms->pt)) {
+                        s_activePopup->Hide();
+                    }
+                }
+            }
+        } else if (s_edgeCallback && s_activePopup) {
+            // --- 菜单折叠时: 鼠标移到屏幕右边缘 → 触发展开 ---
+            if (wParam == WM_MOUSEMOVE) {
+                // 节流: 每 50ms 最多检查一次
+                DWORD now = GetTickCount();
+                if (now - s_lastEdgeCheckMs < kEdgeThrottleMs)
+                    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+                s_lastEdgeCheckMs = now;
+
+                // 边缘触发判断
+                RECT target = s_activePopup->GetTargetRect();
+                bool atRightEdge = (ms->pt.x >= target.right - kEdgeTriggerMargin);
+                bool inYRange = (ms->pt.y >= target.top && ms->pt.y <= target.bottom);
+
+                if (atRightEdge && inYRange) {
+                    s_edgeCallback();  // 触发展开
+                }
+            }
+        }
+    }
+    return CallNextHookEx(nullptr, nCode, wParam, lParam);
+}
+
+void VerticalListPopup::EnableEdgeDetection(VerticalListPopup* popup,
+                                            std::function<void()> onEdgeTrigger) {
+    s_activePopup = popup;
+    s_edgeCallback = std::move(onEdgeTrigger);
+    if (s_mouseHook) return;  // 钩子已安装,仅更新指针和回调(支持弹窗重建)
+    s_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc,
+                                    GetModuleHandleW(nullptr), 0);
+    TraceLog("POPUP", s_mouseHook ? "Edge detection hook installed"
+                                  : "Edge detection hook FAILED");
+}
+
+void VerticalListPopup::DisableEdgeDetection() {
+    if (s_mouseHook) {
+        UnhookWindowsHookEx(s_mouseHook);
+        s_mouseHook = nullptr;
+    }
+    s_activePopup = nullptr;
+    s_edgeCallback = nullptr;
+    TraceLog("POPUP", "Edge detection hook removed");
 }
 
 VerticalListPopup::VerticalListPopup(const AppSettings& s) : settings_(s) {
@@ -73,10 +118,9 @@ VerticalListPopup::VerticalListPopup(const AppSettings& s) : settings_(s) {
 
 VerticalListPopup::~VerticalListPopup() {
     *alive_ = false;
-    if (g_mouseHook && g_activePopup == this) {
-        UnhookWindowsHookEx(g_mouseHook);
-        g_mouseHook = nullptr;
-        g_activePopup = nullptr;
+    // 如果是当前活跃弹窗,清除指针(但不卸载钩子,留给新实例)
+    if (s_activePopup == this) {
+        s_activePopup = nullptr;
     }
     if (hwnd_) DestroyWindow(hwnd_);
     if (bgBrush_) DeleteObject(bgBrush_);
@@ -499,24 +543,37 @@ void VerticalListPopup::Show(const std::vector<TrayIconInfo>& icons) {
     if (showing_) { Hide(); return; }
     UpdateIconList(icons);
     PositionWindow();
-    lastShowTime_ = GetTickCount();
     showing_ = true;
     ShowWindow(hwnd_, SW_SHOW);
     SetFocus(hwndList_);
-    // 安装全局鼠标钩子：点击弹窗外任意位置即关闭
-    g_activePopup = this;
-    g_mouseHook = SetWindowsHookExW(WH_MOUSE_LL, MouseHookProc,
-        GetModuleHandleW(nullptr), 0);
+    // 更新活跃弹窗指针(钩子已在 EnableEdgeDetection 中持久安装)
+    s_activePopup = this;
+}
+
+RECT VerticalListPopup::GetTargetRect() const {
+    RECT rc{};
+    POINT pt; GetCursorPos(&pt);
+    HMONITOR hm = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi{sizeof(mi)};
+    if (!GetMonitorInfoW(hm, &mi)) {
+        // 回退:使用主显示器工作区
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, &rc, 0);
+        return rc;
+    }
+    float s = GetSystemDpiScale();
+    int w = ScaleDpi(s, settings_.appearance.windowWidth);
+    int h = ScaleDpi(s, 400);
+    rc.left   = mi.rcMonitor.right - w;
+    rc.top    = mi.rcMonitor.bottom - h - ScaleDpi(s, 4);
+    rc.right  = mi.rcMonitor.right;
+    rc.bottom = rc.top + h;
+    return rc;
 }
 
 void VerticalListPopup::Hide() {
     if (!showing_) return;
     showing_ = false;
-    if (g_mouseHook) {
-        UnhookWindowsHookEx(g_mouseHook);
-        g_mouseHook = nullptr;
-    }
-    g_activePopup = nullptr;
+    // 不卸载钩子 — 持久保留用于边缘检测
     ShowWindow(hwnd_, SW_HIDE);
 }
 

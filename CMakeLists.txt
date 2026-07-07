@@ -12,8 +12,8 @@ add_compile_definitions(UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
 if(MSVC)
     add_compile_options(/utf-8)
     set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} /SUBSYSTEM:WINDOWS /ENTRY:wWinMainCRTStartup")
-    # 静态链接 C 运行时(可选,避免依赖 vcruntime)
-    # set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
+    # 静态链接 C 运行时(避免依赖 vcruntime)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded")
 endif()
 
 add_executable(TrayVerticalList WIN32
